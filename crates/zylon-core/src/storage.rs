@@ -1,11 +1,13 @@
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, TryLockError},
     io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
     path::Path,
 };
 
 const MAX_RECORD_SIZE: usize = 16 * 1024 * 1024;
+const OP_PUT: u8 = 1;
+const OP_DELETE: u8 = 2;
 
 pub struct StorageEngine {
     file: File,
@@ -13,6 +15,16 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
+    /// Open a database log and rebuild its index.
+    ///
+    /// The open takes an exclusive lock on the file and holds it until this
+    /// value is dropped. A second open fails while that lock is held. If the
+    /// process crashes, the operating system releases the lock.
+    ///
+    /// A crash can leave a partial record, or a final record whose checksum
+    /// does not match, at the end of the file. That torn suffix is truncated
+    /// and synced. A damaged record with bytes after it is left unchanged and
+    /// returned as an error, so recovery does not discard later records.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -20,90 +32,8 @@ impl StorageEngine {
             .create(true)
             .open(path)?;
 
-        let mut index = HashMap::new();
-        let mut offset = 0u64;
-
-        loop {
-            file.seek(SeekFrom::Start(offset))?;
-
-            let mut header = [0u8; 8];
-            let mut read = 0;
-
-            while read < header.len() {
-                let count = file.read(&mut header[read..])?;
-                if count == 0 {
-                    break;
-                }
-                read += count;
-            }
-
-            if read == 0 {
-                break;
-            }
-
-            if read < 8 {
-                file.set_len(offset)?;
-                break;
-            }
-
-            let size = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
-
-            let checksum = u32::from_le_bytes(header[4..8].try_into().unwrap());
-
-            if size < 9 || size > MAX_RECORD_SIZE {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "Invalid record size",
-                ));
-            }
-
-            let mut payload = vec![0u8; size];
-
-            if let Err(error) = file.read_exact(&mut payload) {
-                if error.kind() == ErrorKind::UnexpectedEof {
-                    file.set_len(offset)?;
-                    break;
-                }
-                return Err(error);
-            }
-
-            if crc32fast::hash(&payload) != checksum {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "Record checksum mismatch",
-                ));
-            }
-
-            let operation = payload[0];
-            let key_len = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
-
-            let value_len = u32::from_le_bytes(payload[5..9].try_into().unwrap()) as usize;
-
-            if key_len == 0 || key_len.checked_add(value_len) != Some(size - 9) {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "Invalid record layout",
-                ));
-            }
-
-            let key = payload[9..9 + key_len].to_vec();
-
-            match operation {
-                1 => {
-                    index.insert(key, offset);
-                }
-                2 if value_len == 0 => {
-                    index.remove(&key);
-                }
-                _ => {
-                    return Err(io::Error::new(ErrorKind::InvalidData, "Invalid operation"));
-                }
-            }
-
-            offset += 8 + size as u64;
-        }
-
-        file.seek(SeekFrom::End(0))?;
+        lock_exclusive(&file)?;
+        let index = recover(&mut file)?;
 
         Ok(Self { file, index })
     }
@@ -147,7 +77,7 @@ impl StorageEngine {
     }
 
     pub fn put(&mut self, key: &str, value: &str) -> io::Result<()> {
-        let offset = self.append(1, key.as_bytes(), value.as_bytes())?;
+        let offset = self.append(OP_PUT, key.as_bytes(), value.as_bytes())?;
         self.index.insert(key.as_bytes().to_vec(), offset);
         Ok(())
     }
@@ -183,7 +113,7 @@ impl StorageEngine {
             ));
         }
 
-        if payload[0] != 1 {
+        if payload[0] != OP_PUT {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "Index points to non-value record",
@@ -210,8 +140,136 @@ impl StorageEngine {
     }
 
     pub fn delete(&mut self, key: &str) -> io::Result<()> {
-        self.append(2, key.as_bytes(), &[])?;
+        self.append(OP_DELETE, key.as_bytes(), &[])?;
         self.index.remove(key.as_bytes());
         Ok(())
     }
+}
+
+fn lock_exclusive(file: &File) -> io::Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+            ErrorKind::WouldBlock,
+            "database file is locked by another process",
+        )),
+        Err(TryLockError::Error(error)) => Err(error),
+    }
+}
+
+fn recover(file: &mut File) -> io::Result<HashMap<Vec<u8>, u64>> {
+    let file_len = file.seek(SeekFrom::End(0))?;
+    let mut index = HashMap::new();
+    let mut offset = 0u64;
+
+    while offset < file_len {
+        let remaining = file_len - offset;
+        if remaining < 8 {
+            discard_torn_tail(file, offset)?;
+            break;
+        }
+
+        file.seek(SeekFrom::Start(offset))?;
+        let mut header = [0u8; 8];
+        if let Err(error) = file.read_exact(&mut header) {
+            if error.kind() == ErrorKind::UnexpectedEof {
+                discard_torn_tail(file, offset)?;
+                break;
+            }
+            return Err(error);
+        }
+
+        let size = u32::from_le_bytes(header[..4].try_into().unwrap()) as u64;
+        let checksum = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let Some(record_end) = offset.checked_add(8).and_then(|end| end.checked_add(size)) else {
+            discard_torn_tail(file, offset)?;
+            break;
+        };
+
+        // A header written by a crash can claim a length that runs past EOF.
+        // An illegal length that still sits inside the file is corruption:
+        // later records may follow it, so the tail stays on disk.
+        if size < 9 || size > MAX_RECORD_SIZE as u64 {
+            if record_end > file_len {
+                discard_torn_tail(file, offset)?;
+                break;
+            }
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "Invalid record size",
+            ));
+        }
+
+        if record_end > file_len {
+            discard_torn_tail(file, offset)?;
+            break;
+        }
+
+        let mut payload = vec![0u8; size as usize];
+        if let Err(error) = file.read_exact(&mut payload) {
+            if error.kind() == ErrorKind::UnexpectedEof {
+                discard_torn_tail(file, offset)?;
+                break;
+            }
+            return Err(error);
+        }
+
+        if crc32fast::hash(&payload) != checksum {
+            if record_end == file_len {
+                discard_torn_tail(file, offset)?;
+                break;
+            }
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "Record checksum mismatch",
+            ));
+        }
+
+        apply_record(&mut index, &payload, offset)?;
+        offset = record_end;
+    }
+
+    file.seek(SeekFrom::End(0))?;
+    Ok(index)
+}
+
+fn discard_torn_tail(file: &File, len: u64) -> io::Result<()> {
+    file.set_len(len)?;
+    file.sync_all()
+}
+
+fn apply_record(index: &mut HashMap<Vec<u8>, u64>, payload: &[u8], offset: u64) -> io::Result<()> {
+    if payload.len() < 9 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "Invalid record layout",
+        ));
+    }
+
+    let operation = payload[0];
+    let key_len = u32::from_le_bytes(payload[1..5].try_into().unwrap()) as usize;
+    let value_len = u32::from_le_bytes(payload[5..9].try_into().unwrap()) as usize;
+
+    if key_len == 0 || key_len.checked_add(value_len) != Some(payload.len() - 9) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "Invalid record layout",
+        ));
+    }
+
+    let key = payload[9..9 + key_len].to_vec();
+
+    match operation {
+        OP_PUT => {
+            index.insert(key, offset);
+        }
+        OP_DELETE if value_len == 0 => {
+            index.remove(&key);
+        }
+        _ => {
+            return Err(io::Error::new(ErrorKind::InvalidData, "Invalid operation"));
+        }
+    }
+
+    Ok(())
 }
