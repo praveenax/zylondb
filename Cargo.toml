@@ -1,9 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
-    "crates/zylon-core",
-    "crates/zylon-storage",
-    "crates/zylon-index",
-    "crates/zylon-query",
-    "crates/zylon-node",
+    "crates/zylon-core"
 ]
