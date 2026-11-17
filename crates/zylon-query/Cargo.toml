@@ -1,0 +1,7 @@
+[package]
+name = "zylon-query"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Query execution"
+publish = false
