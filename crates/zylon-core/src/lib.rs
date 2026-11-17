@@ -12,3 +12,7 @@ mod tests {
         assert_eq!(result, 4);
     }
 }
+
+pub mod storage;
+
+pub use storage::StorageEngine;
